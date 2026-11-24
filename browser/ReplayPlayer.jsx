@@ -397,8 +397,12 @@ const ReplayPlayer = forwardRef(function ReplayPlayer({
         }),
         fastStart: "in-memory",
       });
+      // With sound, video chunks wait here until the audio is encoded, so both
+      // can go to the muxer in time order (see the interleaving note below).
+      const videoChunks = [];
       const encoder = new VideoEncoder({
-        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        output: (chunk, meta) =>
+          sound ? videoChunks.push([chunk, meta]) : muxer.addVideoChunk(chunk, meta),
         error: (err) => console.error("encoder", err),
       });
       encoder.configure({
@@ -477,7 +481,22 @@ const ReplayPlayer = forwardRef(function ReplayPlayer({
           console.warn("MP4 export: mixing audio failed; the video will be silent.", err);
           mix = silence(seconds);
         }
-        await encodeAudio(mix, sound.codec, (chunk, meta) => muxer.addAudioChunk(chunk, meta));
+        const audioChunks = [];
+        await encodeAudio(mix, sound.codec, (chunk, meta) => audioChunks.push([chunk, meta]));
+
+        // Interleave by timestamp. The muxer writes chunks in the order it gets
+        // them, so adding all the video and then all the audio put every video
+        // sample before every audio sample in the file. Desktop players don't
+        // mind, but phone players (Discord on mobile, Android's ExoPlayer, iOS)
+        // read the file in order and showed only one track: audio, no video.
+        let a = 0;
+        for (const [chunk, meta] of videoChunks) {
+          while (a < audioChunks.length && audioChunks[a][0].timestamp <= chunk.timestamp) {
+            muxer.addAudioChunk(...audioChunks[a++]);
+          }
+          muxer.addVideoChunk(chunk, meta);
+        }
+        while (a < audioChunks.length) muxer.addAudioChunk(...audioChunks[a++]);
         console.info(`MP4 export: ${recorder.events.length} sounds, ${sound.codec.muxer} audio`);
       }
 
